@@ -11,48 +11,14 @@ import pandas as pd
 from datetime import datetime, timedelta
 from collections import OrderedDict
 
-
-# Record the start time
-start_time = datetime.now()
-print(f"Start Time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print('Device:', device)
-
-lines = open('./input.txt', 'r').read()
-vocab = sorted(list(set(lines)))
-itos = {i:ch for i, ch in enumerate(vocab)}
-stoi = {ch:i for i, ch in enumerate(vocab)}
-vocab = sorted(list(set(lines)))
-
-MASTER_CONFIG = {
-    'context_window': 16,
-    "vocab_size": len(vocab),
-    'd_model': 128,
-    'epochs': 10000,
-    'log_interval': 10,
-    'batch_size': 32,
-    'n_layers': 4,
-    'n_heads': 8,
-}
-
-config = {
-    'batch_size': 32,
-    'context_window': 11,
-    'd_model': 13,
-}
-
-job_type_train = True
-
 # simple tokenization by characters
-def encode(s):
+def encode(s, stoi):
     return [stoi[ch] for ch in s]
 
-def decode(l):
+def decode(l, itos):
     return ''.join([itos[i] for i in l])
 
-def generate(model, config=MASTER_CONFIG, max_new_tokens=30):
-    # idx = torch.zeros(5, 1).long()
+def generate(device, model, config, itos, max_new_tokens=30):
     idx = torch.zeros(5, 1).long().to(device)  # Move idx to the device
     for _ in range(max_new_tokens):
         # call the model
@@ -65,14 +31,30 @@ def generate(model, config=MASTER_CONFIG, max_new_tokens=30):
             p, num_samples=1
         )  # sample from the distribution to get the next token
         idx = torch.cat([idx, idx_next], dim=-1)  # append to the sequence
-    return [decode(x) for x in idx.tolist()]
+    return [decode(x, itos) for x in idx.tolist()]
+
+def generate_from_text(device, model, config, itos, stoi, start_text, max_new_tokens=30):
+    # Encode the starting text
+    idx = torch.tensor([encode(start_text, stoi)], dtype=torch.long).to(device)
+
+    # Generate tokens
+    for _ in range(max_new_tokens):
+        logits = model(idx[:, -config['context_window']:])
+        last_time_step_logits = logits[:, -1, :]
+        p = F.softmax(last_time_step_logits, dim=-1)
+        idx_next = torch.multinomial(p, num_samples=1)
+        idx = torch.cat([idx, idx_next], dim=-1)
+
+    # Decode to get the generated text
+    generated_text = decode(idx[0].tolist(), itos)
+    return generated_text
 
 class SwiGLU(nn.Module):
     """
     Swish-Gated Linear Unit
     https://arxiv.org/pdf/2002.05202v1.pdf
     """
-    def __init__(self, size):
+    def __init__(self, size, config):
         super().__init__()
         self.config = config
         self.linear_gate = nn.Linear(size, size)
@@ -186,7 +168,7 @@ class LlamaBlock(nn.Module):
         self.attention = RoPEMaskedMultiheadAttention(config)
         self.feedforward = nn.Sequential(
             nn.Linear(config['d_model'], config['d_model']),
-            SwiGLU(config['d_model']),
+            SwiGLU(config['d_model'], config),
         )
 
     def forward(self, x):
@@ -208,7 +190,7 @@ class Llama(nn.Module):
 
         self.ffn = nn.Sequential(
             nn.Linear(config['d_model'], config['d_model']),
-            SwiGLU(config['d_model']),
+            SwiGLU(config['d_model'], config),
             nn.Linear(config['d_model'], config['vocab_size']),
         )
 
@@ -228,13 +210,13 @@ class Llama(nn.Module):
 
 # Train part:
 
-def train(model, optimizer, scheduler=None, config=MASTER_CONFIG, print_logs=False):
+def train(device, model, optimizer, dataset, scheduler=None, config=None, print_logs=False):
     losses = []
     start_time = time.time()
     for epoch in range(config['epochs']):
         optimizer.zero_grad()
         
-        xs, ys = get_batches(dataset, 'train', config['batch_size'], config['context_window'])
+        xs, ys = get_batches(dataset, 'train', config['batch_size'], config['context_window'], config)
         xs, ys = xs.to(device), ys.to(device)  # Move data to device
         logits, loss = model(xs, targets=ys)
         loss.backward()
@@ -245,7 +227,7 @@ def train(model, optimizer, scheduler=None, config=MASTER_CONFIG, print_logs=Fal
         
         if epoch % config['log_interval'] == 0:
             batch_time = time.time() - start_time
-            x = evaluate_loss(model)
+            x = evaluate_loss(device, model, dataset, config)
             losses += [x]
             if print_logs:
                 print(f"Epoch {epoch} | val loss {x['val']:.3f} | Time {batch_time:.3f} | ETA in seconds {batch_time * (config['epochs'] - epoch)/config['log_interval'] :.3f}")
@@ -257,7 +239,7 @@ def train(model, optimizer, scheduler=None, config=MASTER_CONFIG, print_logs=Fal
     print("validation loss: ", losses[-1]['val'])
     return pd.DataFrame(losses).plot()
 
-def get_batches(data, split, batch_size, context_window, config=MASTER_CONFIG):
+def get_batches(data, split, batch_size, context_window, config):
     train = data[:int(.8 * len(data))]
     val = data[int(.8 * len(data)): int(.9 * len(data))]
     test = data[int(.9 * len(data)):]
@@ -277,52 +259,91 @@ def get_batches(data, split, batch_size, context_window, config=MASTER_CONFIG):
 
 
 @torch.no_grad()  # don't compute gradients for this function
-def evaluate_loss(model, config=MASTER_CONFIG):
+def evaluate_loss(device, model, dataset, config):
     out = {}
     model.eval()
     model.to(device)  # Ensure model is on the correct device
     for split in ["train", "val"]:
         losses = []
         for _ in range(10):
-            xb, yb = get_batches(dataset, split, config['batch_size'], config['context_window'])
+            xb, yb = get_batches(dataset, split, config['batch_size'], config['context_window'], config)
             xb, yb = xb.to(device), yb.to(device)  # Move data to the same device as model
             _, loss = model(xb, yb)
             losses.append(loss.item())
         out[split] = np.mean(losses)
-    # print('train', 93)
     model.train()
     return out
 
 
-dataset = torch.tensor(encode(lines), dtype=torch.int8)
+def main():
+    # Record the start time
+    start_time = datetime.now()
+    print(f"Start Time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-llama = Llama(MASTER_CONFIG).to(device)
-optimizer = torch.optim.Adam(llama.parameters())
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cpu")
+    print('Device:', device)
 
-if job_type_train:
-    print('training llama')
-    train(llama, optimizer, config=MASTER_CONFIG)
+    lines = open('./input.txt', 'r').read()
+    vocab = sorted(list(set(lines)))
+    itos = {i:ch for i, ch in enumerate(vocab)}
+    stoi = {ch:i for i, ch in enumerate(vocab)}
+    vocab = sorted(list(set(lines)))
 
-    print('Saving the model')
-    torch.save(llama.state_dict(), "llama.pt")
-else:
-    print('Loading the model')
-    llama.load_state_dict(torch.load("llama.pt"))
+    MASTER_CONFIG = {
+        'context_window': 16,
+        "vocab_size": len(vocab),
+        'd_model': 256,
+        'epochs': 100000,
+        'log_interval': 100,
+        'batch_size': 32,
+        'n_layers': 8,
+        'n_heads': 8,
+    }
 
-xs, ys = get_batches(dataset, 'test', MASTER_CONFIG['batch_size'], MASTER_CONFIG['context_window'])
-xs, ys = xs.to(device), ys.to(device)  # Move data to device
+    config = {
+        'batch_size': 32,
+        'context_window': 11,
+        'd_model': 13,
+    }
 
-logits, loss = llama(xs, ys)
+    job_type_train = True
 
-print(loss)
+    dataset = torch.tensor(encode(lines, stoi), dtype=torch.int8)
 
-# Generate part:
-print(generate(llama, MASTER_CONFIG, 500)[0])
+    llama = Llama(MASTER_CONFIG).to(device)
+    optimizer = torch.optim.Adam(llama.parameters())
 
-# Record the end time
-end_time = datetime.now()
-print(f"End Time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    if job_type_train:
+        print('training llama')
+        train(device, llama, optimizer, dataset, config=MASTER_CONFIG, print_logs=True)
 
-# Calculate the time difference
-time_difference = end_time - start_time
-print(f"Time Difference: {str(time_difference)}")
+        print('Saving the model')
+        torch.save(llama.state_dict(), "llama.pt")
+    else:
+        print('Loading the model')
+        llama.load_state_dict(torch.load("llama.pt"))
+
+    xs, ys = get_batches(dataset, 'test', MASTER_CONFIG['batch_size'], MASTER_CONFIG['context_window'], config)
+    xs, ys = xs.to(device), ys.to(device)  # Move data to device
+
+    logits, loss = llama(xs, ys)
+
+    print(loss)
+
+    # Generate part:
+    # print(generate(device, llama, MASTER_CONFIG, itos, 500)[0])
+    text = generate_from_text(device, llama, MASTER_CONFIG, itos, stoi, start_text="Hello", max_new_tokens=50)
+    print(text)
+
+    # Record the end time
+    end_time = datetime.now()
+    print(f"End Time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # Calculate the time difference
+    time_difference = end_time - start_time
+    print(f"Time Difference: {str(time_difference)}")
+
+
+if __name__ == "__main__":
+    main()
